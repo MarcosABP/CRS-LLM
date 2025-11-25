@@ -1,6 +1,7 @@
 #Files
+movies_with_mentions.csv
 test_data.jsonl
 train_data.jsonl
 user_item_train.csv
 user_item_test.csv
-
+.env
