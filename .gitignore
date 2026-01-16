@@ -5,3 +5,4 @@ train_data.jsonl
 user_item_train.csv
 user_item_test.csv
 .env
+*.pkl
