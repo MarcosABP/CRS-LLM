@@ -206,12 +206,6 @@ def get_ground_truth(conv):
     for mid, flags in init_q.items():
         if flags.get('liked') == 1:
             true_ids.add(str(mid))
-    
-    # # System
-    # for mid, flags in resp_q.items():
-    #     if flags.get('liked') in POSITIVE_VALUES:
-    #         true_ids.add(str(mid))
-            
     return true_ids
   
 
@@ -446,7 +440,7 @@ def normalizar_scores_llm(lista_respostas):
                         score_original = int(partes[1].strip())
                         
                         # REGRA 1: Remover negativos
-                        if score_original < 0:
+                        if score_original < 1:
                             continue
                         
                         # REGRA 2: Transformar 0, 1 e 2 em 1

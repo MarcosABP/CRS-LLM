@@ -88,141 +88,118 @@ def comparar_orig_extracao(test_data, responses_list):
 # NAO SEI, VER
 def avaliar_orig(dataset, ease_model, movie_mapper, k_values=[5, 10, 15, 20, 50]):
     """
-    Avaliação completa com Recall e NDCG para múltiplos K.
-    
-    PROTOCOLOS CRAG (PAPER-COMPLIANT): 
-    1. Macro-Average: Média das métricas calculada por turno.
-    2. Context Filtering: Apenas itens positivos/neutros entram no input.
-    3. Masking: Itens vistos são mascarados com -inf na predição.
-    4. Ground Truth: Sugestões do sistema, excluindo o que o usuário já viu.
+    Avaliação CRAG Paper-Compliant:
+    - Train Strict (Liked=1)
+    - Eval Broad (Liked!=0)
+    - OOV Penalty (Conta desconhecidos no denominador)
     """
     
-    # 1. Preparação da Matriz de Pesos (Replicando model.py)
     W = ease_model.B.copy()
     np.fill_diagonal(W, 0)
     n_items = W.shape[0]
     
-    # Inicializa dicionário de resultados
     results = {k: {'recalls': [], 'ndcgs': []} for k in k_values}
     
-    # Loop principal por conversas
-    for conv in tqdm(dataset, desc="CRAG Full Eval"):
-        seeker_id = conv.get("initiatorWorkerId")
-        recommender_id = conv.get("respondentWorkerId")
-        
-        # Carrega metadados de forma segura
+    for conv in tqdm(dataset, desc="CRAG Eval (OOV Penalty)"):
+        # ... (código de metadados init_q, rq, mentions igual) ...
         init_q = conv.get("initiatorQuestions", {})
         if isinstance(init_q, list): init_q = {}
-        
         rq = conv.get("respondentQuestions", {})
         if isinstance(rq, list): rq = {}
-        
         mentions = conv.get("movieMentions", {})
         if not mentions: continue
-        
         mention_keys = list(mentions.keys())
         
-        # 2. Reconstrução da Timeline (Turno a Turno)
+        # ... (reconstrução timeline igual) ...
         timeline = []
         for msg in conv.get("messages", []):
             text = msg.get("text", "")
             ids_in_msg = [int(mid) for mid in mention_keys if f"@{mid}" in text]
-            
             if ids_in_msg:
                 sender = msg.get("senderWorkerId")
                 timeline.append({
                     "ids": ids_in_msg,
-                    "is_rec": (sender == recommender_id),
-                    "is_seek": (sender == seeker_id)
+                    "is_rec": (sender == conv.get("respondentWorkerId")),
+                    "is_seek": (sender == conv.get("initiatorWorkerId"))
                 })
         
-        context_pool = set()  # Itens para Input (Vetor do Usuário)
-        seen_pool = set()     # Histórico Total (Para remover do alvo)
+        context_pool = set()
+        seen_pool = set()
         
         for step in timeline:
             step_ids = step["ids"]
             
-            # 3. Avaliação do Turno do Sistema (Recomendação)
             if step["is_rec"]:
                 targets = []
                 
-                # Definição de Ground Truth
                 for mid in step_ids:
                     mid_str = str(mid)
                     
-                    # Só conta se foi uma sugestão explícita do sistema
-                    resp_flags = rq.get(mid_str, {})
-                    if resp_flags.get("suggested") != 1:
-                        continue
+                    # 1. Sugestão do Sistema (Obrigatório)
+                    if rq.get(mid_str, {}).get("suggested") != 1: continue
                     
-                    # Filtro de Novidade
-                    init_flags = init_q.get(mid_str, {})
-                    if init_flags.get('seen') != 0:
-                        continue
+                    # 2. Novidade (Strict Discovery)
+                    # Exclui apenas se o usuário DISSE que viu. (Aceita 0 e 2)
+                    if init_q.get(mid_str, {}).get('seen') != 0: continue
 
-                    # MUDANÇA: O alvo só é válido se o usuário realmente GOSTOU (1)
-                    if init_flags.get('liked') != 1:
-                        continue
-                    # Exclui se já apareceu na conversa ou não está no treino
-                    if mid in seen_pool or mid not in movie_mapper:
-                        continue
-
-
+                    # 3. Sentimento (Broad Evaluation)
+                    # Aceita tudo que NÃO é Dislike explícito (0).
+                    if init_q.get(mid_str, {}).get('liked') != 1: continue
+                    
+                    # 4. Histórico da Conversa
+                    if mid in seen_pool: continue
+                    
+                    # 5. OOV (Out-of-Vocabulary) - MUDANÇA CRUCIAL
+                    # NÃO fazemos "continue" se não estiver no movie_mapper.
+                    # Nós ADICIONAMOS ao target para ele contar no denominador.
                     targets.append(mid)
                 
-                # Só roda inferência se houver alvos E contexto válido
+                # Só roda inferência se houver contexto
                 if targets and context_pool:
+                    # Filtra apenas o que é possível mapear para o input do modelo
                     input_indices = [movie_mapper[mid] for mid in context_pool if mid in movie_mapper]
                     
                     if input_indices:
-                        # Inferência EASE
                         user_vector = np.zeros(n_items, dtype=np.float32)
                         user_vector[input_indices] = 1.0
                         scores = user_vector @ W
                         
-                        # Mascaramento: Proíbe recomendar o que já foi visto
                         seen_indices = [movie_mapper[mid] for mid in seen_pool if mid in movie_mapper]
                         if seen_indices:
                             scores[seen_indices] = -np.inf
                         
-                        # Ordena apenas uma vez para o maior K
                         max_k = max(k_values)
-                        top_indices_unordered = np.argpartition(scores, -max_k)[-max_k:]
-                        top_scores = scores[top_indices_unordered]
-                        sorted_idx_local = np.argsort(top_scores)[::-1]
-                        top_k_sorted_all = top_indices_unordered[sorted_idx_local]
+                        top_indices = np.argpartition(scores, -max_k)[-max_k:]
+                        top_scores = scores[top_indices]
+                        sorted_idx = np.argsort(top_scores)[::-1]
+                        top_k_sorted = top_indices[sorted_idx]
                         
-                        # Mapeia targets para índices
-                        target_indices = {movie_mapper[t] for t in targets}
+                        # Mapeia targets para índices (APENAS OS CONHECIDOS)
+                        # Os desconhecidos ficam de fora deste set, logo nunca darão "match" (Hit=0)
+                        target_indices = {movie_mapper[t] for t in targets if t in movie_mapper}
+                        
+                        # O denominador inclui TUDO (Conhecidos + Desconhecidos)
                         num_gt = len(targets)
                         
-                        # Calcula métricas para todos os K
                         for k in k_values:
-                            top_k_indices = top_k_sorted_all[:k]
+                            hits = np.array([1 if idx in target_indices else 0 for idx in top_k_sorted[:k]])
                             
-                            # ✅ Cria vetor de hits (1 se acertou, 0 se errou)
-                            hits = np.array([1 if idx in target_indices else 0 
-                                           for idx in top_k_indices])
-                            
-                            # ✅ Usa suas funções
-                            recall_val = recall_at_k(hits, num_gt, k)
-                            ndcg_val = ndcg_at_k(hits, num_gt, k)
-                            
-                            results[k]['recalls'].append(recall_val)
-                            results[k]['ndcgs'].append(ndcg_val)
+                            results[k]['recalls'].append(recall_at_k(hits, num_gt, k))
+                            results[k]['ndcgs'].append(ndcg_at_k(hits, num_gt, k))
             
-            # 4. Atualização dos Pools
             seen_pool.update(step_ids)
             
             if step["is_seek"]:
                 for mid in step_ids:
-                    # Filtro de Contexto: Remove dislike explícito
+                    # Contexto continua Strict (Liked=1) para não poluir o input
                     if str(mid) in init_q and init_q[str(mid)].get('liked') != 1:
                         continue
                     context_pool.add(mid)
     
+    # ... (prints finais iguais) ...
+    # (Copie o final da função original)
 
-    # 5. Relatório Final
+     # 5. Relatório Final
     print("\n" + "="*80)
     print("📊 CRAG OFFLINE - EASE BASELINE (PAPER EXACT - MULTI K)")
     print("="*80)
@@ -249,12 +226,15 @@ def avaliar_orig(dataset, ease_model, movie_mapper, k_values=[5, 10, 15, 20, 50]
     return results
 
 
-
 # NAO SEI, VER
 def avaliar_llm(dataset, extracted_ids_list, ease_model, movie_mapper, k_values=[10, 20, 50]):
     """
     Avaliação Definitiva do Pipeline: LLM (Extração) -> EASE (Recomendação).
-    AJUSTADO PARA STRICT POSITIVE (Apenas liked=1 entra no contexto).
+    
+    LÓGICA PAPER-COMPLIANT:
+    1. Input (Contexto): STRICT (Apenas liked=1 entra).
+    2. Avaliação (Targets): BROAD (Aceita neutros/implícitos, rejeita apenas liked=0).
+    3. Penalidade OOV: Itens desconhecidos contam como erro (entram no denominador).
     """
     
     # 1. Prepara Matriz EASE
@@ -280,9 +260,8 @@ def avaliar_llm(dataset, extracted_ids_list, ease_model, movie_mapper, k_values=
         mentions = conv.get("movieMentions", {})
         if not mentions: continue
         
-        # B. ESTADO DA CONVERSA
-        context_pool = set() # O que entra no EASE (User + LLM Filter)
-        seen_pool = set()    # Histórico total (para não recomendar repetido)
+        context_pool = set()
+        seen_pool = set()
         
         seeker_id = conv.get("initiatorWorkerId")
         recommender_id = conv.get("respondentWorkerId")
@@ -295,53 +274,61 @@ def avaliar_llm(dataset, extracted_ids_list, ease_model, movie_mapper, k_values=
         
         mention_keys = list(mentions.keys())
         
-        # C. LOOP MENSAGEM A MENSAGEM (Turno a Turno)
         for msg in conv.get("messages", []):
             text = msg.get("text", "")
             sender = msg.get("senderWorkerId")
             
-            # Regex rápido para achar IDs @12345 no texto
+            # Acha IDs mencionados nesta mensagem
             ids_found = re.findall(r'@(\d+)', text)
             ids_in_msg = [int(mid) for mid in ids_found if mid in mention_keys]
             
             if not ids_in_msg: continue
             
-            # --- TURNO DO USUÁRIO (Construção do Contexto) ---
+            # --- TURNO DO USUÁRIO (Contexto - STRICT) ---
             if sender == seeker_id:
                 for mid in ids_in_msg:
                     mid_str = str(mid)
                     
-                    # 1. A LLM reconheceu este item? (O Gate)
-                    if mid_str in llm_recognized_ids:
-                        context_pool.add(mid)
-                        stats['items_extracted_by_llm'] += 1
-                    
-                    # Atualiza seen_pool
+                    # 1. A LLM reconheceu? (Filtro da Extração)
+                    if mid_str not in llm_recognized_ids:
+                        continue
+                        
+                    # 2. CONDIZÊNCIA: É positivo explícito? (Strict Context)
+                    # Para INPUT, só usamos o que é certeza (liked=1)
+                    val = init_q.get(mid_str, {}).get('liked')
+                    if val != 1: 
+                        continue 
+                        
+                    context_pool.add(mid)
+                    stats['items_extracted_by_llm'] += 1
                     seen_pool.add(mid)
 
-            # --- TURNO DO SISTEMA (Avaliação) ---
+            # --- TURNO DO SISTEMA (Targets - BROAD + OOV Penalty) ---
             elif sender == recommender_id:
-                
-                # Identifica Targets Válidos
                 targets = []
                 for mid in ids_in_msg:
                     mid_str = str(mid)
                     
-                    # Regra 1: É sugestão explícita?
+                    # 1. Sugestão do Sistema
                     if rq.get(mid_str, {}).get('suggested') != 1: continue
                     
-                    # Regra 2: Usuário já viu/conhece?
-                    if init_q.get(mid_str, {}).get('seen', 0) != 0: continue
+                    # 2. Novidade (Remove apenas se DISSE que viu)
+                    if init_q.get(mid_str, {}).get('seen') != 0: continue
                     
-                    # Regra 3: Já foi mencionado antes na conversa?
+                    # 3. Sentimento (Remove apenas se DISSE que não gostou)
+                    # Aceita 1 (Like), 2 (Neutro/Aceitou) e None
+                    if init_q.get(mid_str, {}).get('liked') != 1: continue 
+                    
+                    # 4. Histórico
                     if mid in seen_pool: 
                         stats['targets_blocked_by_history'] += 1
                         continue
                     
-                    if mid in movie_mapper:
-                        targets.append(mid)
+                    # 5. OOV Penalty: ADICIONAMOS mesmo se não estiver no mapper
+                    # Isso garante que o denominador (num_gt) seja o "Real"
+                    targets.append(mid)
                 
-                # Validação para rodar inferência
+                # Validações para inferência
                 if not context_pool:
                     stats['skipped_no_context'] += 1
                     seen_pool.update(ids_in_msg)
@@ -364,49 +351,37 @@ def avaliar_llm(dataset, extracted_ids_list, ease_model, movie_mapper, k_values=
                 user_vector[input_indices] = 1.0
                 scores = user_vector @ W
                 
-                # --- MASKING ---
+                # Masking
                 mask_ids = seen_pool | context_pool
                 mask_indices = [movie_mapper[mid] for mid in mask_ids if mid in movie_mapper]
-                
                 if mask_indices:
                     scores[mask_indices] = -np.inf
                 
-                # --- MÉTRICAS TOP-K ---
-                target_indices = {movie_mapper[t] for t in targets}
-                num_gt = len(targets)
+                # Métricas
                 max_k = max(k_values)
-                
-                # Otimização de ordenação (argpartition)
                 top_indices = np.argpartition(scores, -max_k)[-max_k:]
                 top_scores = scores[top_indices]
                 sorted_idx = np.argsort(top_scores)[::-1]
                 top_k_sorted = top_indices[sorted_idx]
                 
-                # ✅ Calcula métricas usando suas funções
+                # Mapeia targets para índices (APENAS OS CONHECIDOS)
+                # OOV nunca dará match (Hit=0), mas contou no len(targets)
+                target_indices = {movie_mapper[t] for t in targets if t in movie_mapper}
+                num_gt = len(targets)
+                
                 for k in k_values:
-                    current_top_k = top_k_sorted[:k]
-                    
-                    # ✅ Cria vetor de hits (1 se acertou, 0 se errou)
-                    hits = np.array([1 if idx in target_indices else 0 
-                                   for idx in current_top_k])
-                    
-                    # ✅ Usa suas funções
-                    recall_val = recall_at_k(hits, num_gt, k)
-                    ndcg_val = ndcg_at_k(hits, num_gt, k)
-                    
-                    results[k]['recalls'].append(recall_val)
-                    results[k]['ndcgs'].append(ndcg_val)
+                    hits = np.array([1 if idx in target_indices else 0 for idx in top_k_sorted[:k]])
+                    results[k]['recalls'].append(recall_at_k(hits, num_gt, k))
+                    results[k]['ndcgs'].append(ndcg_at_k(hits, num_gt, k))
                 
                 stats['turns_evaluated'] += 1
-                
-                # Atualização Final
                 seen_pool.update(ids_in_msg)
 
     # ============================================
     # RELATÓRIO FINAL
     # ============================================
     print("\n" + "="*80)
-    print("🚀 RESULTADOS FINAIS: Pipeline LLM + EASE (STRICT POSITIVE MODE)")
+    print("🚀 RESULTADOS FINAIS: Pipeline LLM + EASE (PAPER COMPLIANT)")
     print("="*80)
     
     header = f"{'Metric':<12}" + "".join([f"K={k:<10}" for k in k_values])
